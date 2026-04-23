@@ -50,3 +50,15 @@ uv run python -m src.train.run_grpo \
 - `--autopsy-probe-seed`: deterministic probe-set seed
 - `--autopsy-group-size`: rollouts per probe prompt (defaults to `--group-size`)
 - `--autopsy-checkpoint-every`: save model snapshots every N rollout steps
+
+## Weights & Biases tracking defaults
+
+Training scripts now default to:
+
+- `entity=sm12377-new-york-university`
+- `project=smallModelGrpo`
+
+and upload full run output directories as artifacts by default:
+
+- use `--no-wandb-log-output-artifact` to skip artifact upload
+- use `--wandb-mode disabled` to disable W&B entirely

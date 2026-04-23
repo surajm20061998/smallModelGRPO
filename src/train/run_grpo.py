@@ -97,9 +97,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
 
-    parser.add_argument("--wandb-project", default="nyuLLMReasoners3")
-    parser.add_argument("--wandb-entity", default="surajm20061998-new-york-university")
+    parser.add_argument("--wandb-project", default="smallModelGrpo")
+    parser.add_argument("--wandb-entity", default="sm12377-new-york-university")
     parser.add_argument("--wandb-mode", default="online", choices=["online", "offline", "disabled"])
+    parser.add_argument("--wandb-log-output-artifact", dest="wandb_log_output_artifact", action="store_true")
+    parser.add_argument("--no-wandb-log-output-artifact", dest="wandb_log_output_artifact", action="store_false")
+    parser.set_defaults(wandb_log_output_artifact=True)
     parser.add_argument("--enable-autopsy-recorder", action="store_true")
     parser.add_argument("--autopsy-every", type=int, default=10)
     parser.add_argument("--autopsy-num-probe-prompts", type=int, default=50)
@@ -237,6 +240,23 @@ def maybe_init_wandb(args, config: dict[str, Any]):
 def maybe_log_wandb(run, metrics: dict[str, Any]) -> None:
     if run is not None:
         run.log(metrics)
+
+
+def maybe_log_wandb_output_artifact(run, output_dir: Path, args) -> None:
+    if run is None or not args.wandb_log_output_artifact:
+        return
+    if wandb is None:
+        return
+
+    artifact_name = args.run_name or output_dir.name or "grpo_run"
+    artifact_name = artifact_name.replace("/", "-")
+    artifact = wandb.Artifact(
+        name=f"{artifact_name}-outputs",
+        type="training-run-output",
+        description="End-to-end GRPO run outputs (metrics, rollouts, checkpoints, autopsy artifacts).",
+    )
+    artifact.add_dir(str(output_dir))
+    run.log_artifact(artifact)
 
 
 def make_sampling_params(
@@ -787,6 +807,7 @@ def main() -> None:
 
     maybe_log_wandb(run, {f"final/{k}": v for k, v in final_metrics.items()})
     if run is not None:
+        maybe_log_wandb_output_artifact(run, output_dir, args)
         run.finish()
 
 
