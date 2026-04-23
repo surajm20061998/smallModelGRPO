@@ -18,12 +18,14 @@ class RolloutRecorder:
         group_size: int,
         max_new_tokens: int,
         stop_sequence: str | None,
+        logprob_batch_size: int,
     ) -> None:
         self.output_dir = output_dir
         self.probe_set = probe_set
         self.group_size = group_size
         self.max_new_tokens = max_new_tokens
         self.stop_sequence = stop_sequence
+        self.logprob_batch_size = max(1, int(logprob_batch_size))
 
         self.rollouts_dir = output_dir / "rollouts"
         self.tensors_dir = output_dir / "tensors"
@@ -69,6 +71,54 @@ class RolloutRecorder:
         payload = [asdict(probe) for probe in self.probe_set]
         manifest_path.write_text(json.dumps(payload, indent=2))
 
+    def _score_tokenized_with_backoff(
+        self,
+        *,
+        policy,
+        input_ids: torch.Tensor,
+        labels: torch.Tensor,
+        policy_device: str,
+    ) -> tuple[torch.Tensor, torch.Tensor, int]:
+        batch_size = self.logprob_batch_size
+        last_error: Exception | None = None
+
+        while batch_size >= 1:
+            try:
+                log_probs_chunks = []
+                entropy_chunks = []
+                with torch.inference_mode():
+                    for start in range(0, input_ids.shape[0], batch_size):
+                        end = min(start + batch_size, input_ids.shape[0])
+                        scored = get_response_log_probs(
+                            model=policy,
+                            input_ids=input_ids[start:end].to(policy_device),
+                            labels=labels[start:end].to(policy_device),
+                            return_token_entropy=True,
+                        )
+                        log_probs_chunks.append(scored["log_probs"].detach().cpu())
+                        entropy_chunks.append(scored["token_entropy"].detach().cpu())
+                return (
+                    torch.cat(log_probs_chunks, dim=0),
+                    torch.cat(entropy_chunks, dim=0),
+                    batch_size,
+                )
+            except torch.cuda.OutOfMemoryError as exc:
+                last_error = exc
+            except RuntimeError as exc:
+                if "out of memory" not in str(exc).lower():
+                    raise
+                last_error = exc
+
+            torch.cuda.empty_cache()
+            if batch_size == 1:
+                break
+            batch_size = max(1, batch_size // 2)
+
+        raise RuntimeError(
+            "Autopsy recorder ran out of memory while scoring token log-probs/entropy. "
+            "Try lowering --autopsy-logprob-batch-size and/or --autopsy-group-size."
+        ) from last_error
+
     def record_step(
         self,
         *,
@@ -97,15 +147,12 @@ class RolloutRecorder:
         ]
 
         tokenized = tokenize_prompt_and_output(repeated_prompts, responses, tokenizer)
-        with torch.inference_mode():
-            scored = get_response_log_probs(
-                model=policy,
-                input_ids=tokenized["input_ids"].to(policy_device),
-                labels=tokenized["labels"].to(policy_device),
-                return_token_entropy=True,
-            )
-        response_log_probs = scored["log_probs"].detach().cpu()
-        token_entropy = scored["token_entropy"].detach().cpu()
+        response_log_probs, token_entropy, used_batch_size = self._score_tokenized_with_backoff(
+            policy=policy,
+            input_ids=tokenized["input_ids"],
+            labels=tokenized["labels"],
+            policy_device=policy_device,
+        )
         response_mask = tokenized["response_mask"].detach().cpu()
         input_ids = tokenized["input_ids"].detach().cpu()
         labels = tokenized["labels"].detach().cpu()
@@ -171,4 +218,5 @@ class RolloutRecorder:
             "autopsy/group_size": self.group_size,
             "autopsy/num_rollouts": num_rollouts,
             "autopsy/mean_reward": mean_reward,
+            "autopsy/logprob_batch_size_used": used_batch_size,
         }

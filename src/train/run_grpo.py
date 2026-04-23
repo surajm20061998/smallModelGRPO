@@ -124,6 +124,12 @@ def parse_args() -> argparse.Namespace:
         default=50,
         help="Also snapshot a checkpoint every N rollout steps when recorder is enabled.",
     )
+    parser.add_argument(
+        "--autopsy-logprob-batch-size",
+        type=int,
+        default=16,
+        help="Microbatch size for autopsy policy scoring (log-probs/entropy).",
+    )
     return parser.parse_args()
 
 
@@ -423,6 +429,8 @@ def main() -> None:
         raise ValueError("autopsy_every must be positive when autopsy recorder is enabled")
     if args.enable_autopsy_recorder and args.autopsy_num_probe_prompts <= 0:
         raise ValueError("autopsy_num_probe_prompts must be positive")
+    if args.enable_autopsy_recorder and args.autopsy_logprob_batch_size <= 0:
+        raise ValueError("autopsy_logprob_batch_size must be positive")
 
     set_seed(args.seed)
     rng = random.Random(args.seed)
@@ -505,6 +513,7 @@ def main() -> None:
             group_size=autopsy_group_size,
             max_new_tokens=args.max_new_tokens,
             stop_sequence=args.stop_sequence,
+            logprob_batch_size=args.autopsy_logprob_batch_size,
         )
         recorder.save_probe_manifest()
 
@@ -649,6 +658,7 @@ def main() -> None:
             },
         )
         if recorder is not None and rollout_step % args.autopsy_every == 0:
+            torch.cuda.empty_cache()
             autopsy_metrics = recorder.record_step(
                 step=rollout_step,
                 llm=llm,
