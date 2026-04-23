@@ -62,3 +62,25 @@ and upload full run output directories as artifacts by default:
 
 - use `--no-wandb-log-output-artifact` to skip artifact upload
 - use `--wandb-mode disabled` to disable W&B entirely
+
+## One-command autopsy suite
+
+Use:
+
+```bash
+bash scripts/run_autopsy_suite.sh
+```
+
+This launches:
+
+1. pilot runs (default seeds: `42 43 44`, 20 steps)
+2. full runs (default seeds: `42 43 44`, 200 steps)
+3. one off-policy contrast run (default seed: first seed)
+
+Useful overrides:
+
+- `AUTOPSY_OUT_ROOT` (default `runs/autopsy_v1`)
+- `AUTOPSY_SEEDS` (default `"42 43 44"`)
+- `WANDB_MODE` (default `online`)
+- `CUDA_DEVICES` (default `0,1`)
+- `RUN_PILOT`, `RUN_FULL`, `RUN_OFFPOLICY` (set to `0` to skip a stage)
