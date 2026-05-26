@@ -38,7 +38,7 @@ uv run python -m src.train.run_grpo \
   --autopsy-probe-split dev \
   --autopsy-probe-seed 123 \
   --autopsy-checkpoint-every 10 \
-  --wandb-mode offline
+  --wandb-mode online
 ```
 
 ### Key recorder flags
