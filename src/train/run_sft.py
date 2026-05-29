@@ -15,6 +15,7 @@ except Exception:
     wandb = None
 
 from src.data_bootstrap import ensure_repo_data_path, resolve_repo_path
+from src.infer.hf_generate import HFGenerator, HFSamplingParams
 
 from src.train.sft import (
     get_response_log_probs,
@@ -25,6 +26,12 @@ from src.train.sft import (
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent.parent
+
+DTYPE_MAP = {
+    "bfloat16": torch.bfloat16,
+    "float16": torch.float16,
+    "float32": torch.float32,
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -74,6 +81,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--policy-device", default="cuda:0")
     parser.add_argument("--vllm-device", default="cuda:1")
     parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.85)
+    parser.add_argument("--backend", default="cuda", choices=["cuda", "mps", "cpu"])
+    parser.add_argument("--dtype", default=None, choices=["bfloat16", "float16", "float32"])
+    parser.add_argument("--gen-batch-size", type=int, default=8)
 
     parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument("--num-workers", type=int, default=0)
@@ -126,17 +136,85 @@ def init_tokenizer(model_id: str):
     return tokenizer
 
 
-def init_policy(model_id: str, device: str, gradient_checkpointing: bool):
+def init_policy(model_id: str, device: str, gradient_checkpointing: bool, dtype: torch.dtype):
     from transformers import AutoModelForCausalLM
 
     policy = AutoModelForCausalLM.from_pretrained(
         model_id,
-        torch_dtype=torch.bfloat16,
+        torch_dtype=dtype,
     ).to(device)
     if gradient_checkpointing:
         policy.gradient_checkpointing_enable()
     policy.config.use_cache = False
     return policy
+
+
+def resolve_runtime(args) -> tuple[str, str, torch.dtype]:
+    backend = args.backend
+    if backend == "cuda":
+        device = args.policy_device
+    elif backend == "mps":
+        device = "mps"
+    else:
+        device = "cpu"
+
+    if args.dtype is not None:
+        dtype = DTYPE_MAP[args.dtype]
+    else:
+        dtype = torch.bfloat16 if backend == "cuda" else torch.float32
+    return backend, device, dtype
+
+
+def init_generator(
+    backend: str,
+    *,
+    model_id: str,
+    policy,
+    tokenizer,
+    device: str,
+    seed: int,
+    vllm_device: str,
+    gpu_memory_utilization: float,
+    gen_batch_size: int,
+):
+    if backend == "cuda":
+        return init_vllm(
+            model_id=model_id,
+            device=vllm_device,
+            seed=seed,
+            gpu_memory_utilization=gpu_memory_utilization,
+        )
+    return HFGenerator(
+        model=policy,
+        tokenizer=tokenizer,
+        device=device,
+        batch_size=gen_batch_size,
+    )
+
+
+def sync_policy_to_generator(policy, generator, backend: str) -> None:
+    if backend == "cuda":
+        load_policy_into_vllm_instance(policy, generator)
+    else:
+        generator.model = policy
+
+
+def free_accelerator_memory(backend: str) -> None:
+    if backend == "cuda":
+        torch.cuda.empty_cache()
+    elif backend == "mps":
+        try:
+            torch.mps.empty_cache()
+        except Exception:
+            pass
+
+
+def make_sampling_params(*, backend: str, temperature: float, max_tokens: int):
+    if backend != "cuda":
+        return HFSamplingParams(temperature=temperature, max_tokens=max_tokens)
+    from vllm import SamplingParams
+
+    return SamplingParams(temperature=temperature, max_tokens=max_tokens)
 
 
 def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: float = 0.85):
@@ -237,17 +315,21 @@ def evaluate_prompts(
     ground_truths: list[str],
     temperature: float,
     max_new_tokens: int,
+    backend: str,
     max_examples: int | None = None,
     prefix: str = "eval",
 ) -> dict[str, float]:
-    from vllm import SamplingParams
     from src.grading.grader_math import question_only_reward_fn
 
     if max_examples is not None and max_examples > 0:
         prompts = prompts[:max_examples]
         ground_truths = ground_truths[:max_examples]
 
-    params = SamplingParams(temperature=temperature, max_tokens=max_new_tokens)
+    params = make_sampling_params(
+        backend=backend,
+        temperature=temperature,
+        max_tokens=max_new_tokens,
+    )
     outputs = llm.generate(prompts, params)
 
     num = len(outputs)
@@ -327,6 +409,8 @@ def main() -> None:
     args = parse_args()
     set_seed(args.seed)
 
+    backend, device, dtype = resolve_runtime(args)
+
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     try:
@@ -349,12 +433,17 @@ def main() -> None:
     intellect_test_path = ensure_repo_data_path(args.intellect_test_path)
 
     tokenizer = init_tokenizer(args.model_id)
-    policy = init_policy(args.model_id, args.policy_device, args.gradient_checkpointing)
-    llm = init_vllm(
+    policy = init_policy(args.model_id, device, args.gradient_checkpointing, dtype)
+    llm = init_generator(
+        backend,
         model_id=args.model_id,
-        device=args.vllm_device,
+        policy=policy,
+        tokenizer=tokenizer,
+        device=device,
         seed=args.seed,
+        vllm_device=args.vllm_device,
         gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+        gen_batch_size=args.gen_batch_size,
     )
 
     optimizer = torch.optim.AdamW(
@@ -396,8 +485,8 @@ def main() -> None:
         nonlocal eval_step, best_metric, best_checkpoint_path
 
         policy.eval()
-        torch.cuda.empty_cache()
-        load_policy_into_vllm_instance(policy, llm)
+        free_accelerator_memory(backend)
+        sync_policy_to_generator(policy, llm, backend)
 
         metrics = {}
         metrics.update(
@@ -407,6 +496,7 @@ def main() -> None:
                 intellect_dev_gts,
                 temperature=args.temperature,
                 max_new_tokens=args.max_new_tokens,
+                backend=backend,
                 max_examples=args.intellect_val_max_examples,
                 prefix="intellect_dev",
             )
@@ -418,6 +508,7 @@ def main() -> None:
                 math_val_gts,
                 temperature=args.temperature,
                 max_new_tokens=args.max_new_tokens,
+                backend=backend,
                 max_examples=args.math_val_max_examples,
                 prefix="math_val",
             )
@@ -467,9 +558,9 @@ def main() -> None:
             micro_step += 1
             accum_counter += 1
 
-            input_ids = batch["input_ids"].to(args.policy_device)
-            labels = batch["labels"].to(args.policy_device)
-            response_mask = batch["response_mask"].to(args.policy_device)
+            input_ids = batch["input_ids"].to(device)
+            labels = batch["labels"].to(device)
+            response_mask = batch["response_mask"].to(device)
 
             outputs = get_response_log_probs(
                 model=policy,
@@ -548,16 +639,16 @@ def main() -> None:
         best_checkpoint_path = str(best_dir)
 
     del policy
-    torch.cuda.empty_cache()
+    free_accelerator_memory(backend)
 
     best_policy = AutoModelForCausalLM.from_pretrained(
         best_checkpoint_path,
-        torch_dtype=torch.bfloat16,
-    ).to(args.policy_device)
+        torch_dtype=dtype,
+    ).to(device)
     best_policy.config.use_cache = False
     best_policy.eval()
 
-    load_policy_into_vllm_instance(best_policy, llm)
+    sync_policy_to_generator(best_policy, llm, backend)
 
     final_metrics = {}
     final_metrics.update(
@@ -567,6 +658,7 @@ def main() -> None:
             intellect_test_gts,
             temperature=args.temperature,
             max_new_tokens=args.max_new_tokens,
+            backend=backend,
             max_examples=None,
             prefix="intellect_test",
         )
@@ -578,6 +670,7 @@ def main() -> None:
             math_test_gts,
             temperature=args.temperature,
             max_new_tokens=args.max_new_tokens,
+            backend=backend,
             max_examples=args.math_test_max_examples,
             prefix="math_test",
         )

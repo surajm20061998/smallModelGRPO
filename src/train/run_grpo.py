@@ -23,8 +23,16 @@ from src.grading.grader_countdown import (
 )
 from src.autopsy.probe_set import build_fixed_countdown_probe_set
 from src.autopsy.rollout_recorder import RolloutRecorder
+from src.infer.hf_generate import HFGenerator, HFSamplingParams
 from src.train.grpo import compute_group_normalized_rewards, grpo_microbatch_train_step
 from src.train.sft import get_response_log_probs, tokenize_prompt_and_output
+
+
+DTYPE_MAP = {
+    "bfloat16": torch.bfloat16,
+    "float16": torch.float16,
+    "float32": torch.float32,
+}
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -91,6 +99,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--countdown-dev-max-examples", type=int, default=256)
     parser.add_argument("--countdown-test-max-examples", type=int, default=1024)
 
+    parser.add_argument(
+        "--backend",
+        default="cuda",
+        choices=["cuda", "mps", "cpu"],
+        help="cuda uses vLLM rollouts; mps/cpu use a local HF generate backend (no vLLM).",
+    )
+    parser.add_argument(
+        "--dtype",
+        default=None,
+        choices=["bfloat16", "float16", "float32"],
+        help="Model dtype. Defaults to bfloat16 on cuda, float32 on mps/cpu.",
+    )
+    parser.add_argument(
+        "--gen-batch-size",
+        type=int,
+        default=8,
+        help="Generation microbatch size for the local (mps/cpu) HF backend.",
+    )
     parser.add_argument("--policy-device", default="cuda:0")
     parser.add_argument("--vllm-device", default="cuda:1")
     parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.85)
@@ -161,17 +187,77 @@ def init_tokenizer(model_id: str):
     return tokenizer
 
 
-def init_policy(model_id: str, device: str, gradient_checkpointing: bool):
+def init_policy(model_id: str, device: str, gradient_checkpointing: bool, dtype: torch.dtype):
     from transformers import AutoModelForCausalLM
 
     policy = AutoModelForCausalLM.from_pretrained(
         model_id,
-        torch_dtype=torch.bfloat16,
+        torch_dtype=dtype,
     ).to(device)
     if gradient_checkpointing:
         policy.gradient_checkpointing_enable()
     policy.config.use_cache = False
     return policy
+
+
+def resolve_runtime(args) -> tuple[str, str, torch.dtype]:
+    backend = args.backend
+    if backend == "cuda":
+        device = args.policy_device
+    elif backend == "mps":
+        device = "mps"
+    else:
+        device = "cpu"
+
+    if args.dtype is not None:
+        dtype = DTYPE_MAP[args.dtype]
+    else:
+        dtype = torch.bfloat16 if backend == "cuda" else torch.float32
+    return backend, device, dtype
+
+
+def init_generator(
+    backend: str,
+    *,
+    model_id: str,
+    policy,
+    tokenizer,
+    device: str,
+    seed: int,
+    vllm_device: str,
+    gpu_memory_utilization: float,
+    gen_batch_size: int,
+):
+    if backend == "cuda":
+        return init_vllm(
+            model_id=model_id,
+            device=vllm_device,
+            seed=seed,
+            gpu_memory_utilization=gpu_memory_utilization,
+        )
+    return HFGenerator(
+        model=policy,
+        tokenizer=tokenizer,
+        device=device,
+        batch_size=gen_batch_size,
+    )
+
+
+def sync_policy_to_generator(policy, generator, backend: str) -> None:
+    if backend == "cuda":
+        load_policy_into_vllm_instance(policy, generator)
+    else:
+        generator.model = policy
+
+
+def free_accelerator_memory(backend: str) -> None:
+    if backend == "cuda":
+        torch.cuda.empty_cache()
+    elif backend == "mps":
+        try:
+            torch.mps.empty_cache()
+        except Exception:
+            pass
 
 
 def ensure_pynvml_compat() -> None:
@@ -267,12 +353,23 @@ def maybe_log_wandb_output_artifact(run, output_dir: Path, args) -> None:
 
 def make_sampling_params(
     *,
+    backend: str,
     temperature: float,
     max_tokens: int,
     stop_sequence: str | None,
     top_p: float = 1.0,
     min_tokens: int = 0,
 ):
+    if backend != "cuda":
+        return HFSamplingParams(
+            temperature=temperature,
+            top_p=top_p,
+            min_tokens=min_tokens,
+            max_tokens=max_tokens,
+            stop=[stop_sequence] if stop_sequence else None,
+            include_stop_str_in_output=bool(stop_sequence),
+        )
+
     from vllm import SamplingParams
 
     kwargs = {
@@ -313,6 +410,7 @@ def evaluate_countdown(
     ground_truths: list[dict[str, Any]],
     max_new_tokens: int,
     stop_sequence: str | None,
+    backend: str,
     max_examples: int | None = None,
     prefix: str = "eval",
 ) -> dict[str, float]:
@@ -323,6 +421,7 @@ def evaluate_countdown(
     outputs = llm.generate(
         prompts,
         make_sampling_params(
+            backend=backend,
             temperature=0.0,
             max_tokens=max_new_tokens,
             stop_sequence=stop_sequence,
@@ -435,6 +534,8 @@ def main() -> None:
     set_seed(args.seed)
     rng = random.Random(args.seed)
 
+    backend, device, dtype = resolve_runtime(args)
+
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     try:
@@ -475,12 +576,17 @@ def main() -> None:
     )
 
     tokenizer = init_tokenizer(args.model_id)
-    policy = init_policy(args.model_id, args.policy_device, args.gradient_checkpointing)
-    llm = init_vllm(
+    policy = init_policy(args.model_id, device, args.gradient_checkpointing, dtype)
+    llm = init_generator(
+        backend,
         model_id=args.model_id,
-        device=args.vllm_device,
+        policy=policy,
+        tokenizer=tokenizer,
+        device=device,
         seed=args.seed,
+        vllm_device=args.vllm_device,
         gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+        gen_batch_size=args.gen_batch_size,
     )
 
     optimizer = torch.optim.AdamW(
@@ -521,8 +627,8 @@ def main() -> None:
         nonlocal eval_step, best_dev_accuracy, best_checkpoint_path, last_dev_metrics
 
         policy.eval()
-        torch.cuda.empty_cache()
-        load_policy_into_vllm_instance(policy, llm)
+        free_accelerator_memory(backend)
+        sync_policy_to_generator(policy, llm, backend)
 
         metrics = evaluate_countdown(
             llm,
@@ -530,6 +636,7 @@ def main() -> None:
             dev_ground_truths,
             max_new_tokens=args.max_new_tokens,
             stop_sequence=args.stop_sequence,
+            backend=backend,
             max_examples=None,
             prefix="countdown_dev",
         )
@@ -579,7 +686,7 @@ def main() -> None:
     num_prompts_per_rollout = args.rollout_batch_size // args.group_size
     for rollout_step in range(1, args.num_rollout_steps + 1):
         policy.eval()
-        load_policy_into_vllm_instance(policy, llm)
+        sync_policy_to_generator(policy, llm, backend)
 
         rollout_prompts, rollout_ground_truths = sample_rollout_examples(
             train_ds,
@@ -597,6 +704,7 @@ def main() -> None:
         rollout_outputs = llm.generate(
             repeated_prompts,
             make_sampling_params(
+                backend=backend,
                 temperature=args.rollout_temperature,
                 top_p=args.rollout_top_p,
                 min_tokens=args.rollout_min_tokens,
@@ -625,7 +733,7 @@ def main() -> None:
                 input_ids=tokenized["input_ids"],
                 labels=tokenized["labels"],
                 batch_size=args.old_logprob_batch_size,
-                device=args.policy_device,
+                device=device,
             )
 
         rollout_record = {
@@ -658,20 +766,21 @@ def main() -> None:
             },
         )
         if recorder is not None and rollout_step % args.autopsy_every == 0:
-            torch.cuda.empty_cache()
+            free_accelerator_memory(backend)
             autopsy_metrics = recorder.record_step(
                 step=rollout_step,
                 llm=llm,
                 policy=policy,
                 tokenizer=tokenizer,
                 sampling_params=make_sampling_params(
+                    backend=backend,
                     temperature=args.rollout_temperature,
                     top_p=args.rollout_top_p,
                     min_tokens=args.rollout_min_tokens,
                     max_tokens=args.max_new_tokens,
                     stop_sequence=args.stop_sequence,
                 ),
-                policy_device=args.policy_device,
+                policy_device=device,
             )
             append_jsonl(
                 output_dir / "autopsy_history.jsonl",
@@ -701,9 +810,9 @@ def main() -> None:
                 clipfrac_values = []
 
                 for micro_indices in microbatches:
-                    current_input_ids = tokenized["input_ids"][micro_indices].to(args.policy_device)
-                    current_labels = tokenized["labels"][micro_indices].to(args.policy_device)
-                    current_response_mask = tokenized["response_mask"][micro_indices].to(args.policy_device)
+                    current_input_ids = tokenized["input_ids"][micro_indices].to(device)
+                    current_labels = tokenized["labels"][micro_indices].to(device)
+                    current_response_mask = tokenized["response_mask"][micro_indices].to(device)
 
                     current_log_probs = get_response_log_probs(
                         model=policy,
@@ -717,10 +826,10 @@ def main() -> None:
                         response_mask=current_response_mask,
                         gradient_accumulation_steps=len(microbatches),
                         loss_type=args.loss_type,
-                        raw_rewards=raw_rewards[micro_indices].unsqueeze(-1).to(args.policy_device),
-                        advantages=advantages[micro_indices].unsqueeze(-1).to(args.policy_device),
+                        raw_rewards=raw_rewards[micro_indices].unsqueeze(-1).to(device),
+                        advantages=advantages[micro_indices].unsqueeze(-1).to(device),
                         old_log_probs=(
-                            old_log_probs[micro_indices].to(args.policy_device)
+                            old_log_probs[micro_indices].to(device)
                             if old_log_probs is not None
                             else None
                         ),
@@ -773,15 +882,15 @@ def main() -> None:
         best_dev_accuracy = float("nan")
 
     del policy
-    torch.cuda.empty_cache()
+    free_accelerator_memory(backend)
 
     best_policy = AutoModelForCausalLM.from_pretrained(
         best_checkpoint_path,
-        torch_dtype=torch.bfloat16,
-    ).to(args.policy_device)
+        torch_dtype=dtype,
+    ).to(device)
     best_policy.config.use_cache = False
     best_policy.eval()
-    load_policy_into_vllm_instance(best_policy, llm)
+    sync_policy_to_generator(best_policy, llm, backend)
 
     final_metrics = evaluate_countdown(
         llm,
@@ -789,6 +898,7 @@ def main() -> None:
         test_ground_truths,
         max_new_tokens=args.max_new_tokens,
         stop_sequence=args.stop_sequence,
+        backend=backend,
         max_examples=None,
         prefix="countdown_test",
     )

@@ -10,6 +10,12 @@ The Python entrypoints are set up for `uv run python -m ...` usage from a
 fresh checkout. If `data-distrib/` is missing but `data.tgz` is present, the
 required dataset files are extracted on first use by [data_bootstrap.py](src/data_bootstrap.py).
 
+Both training loops are backend-agnostic: the default CUDA path uses vLLM for
+fast rollouts, while a `--backend mps`/`--backend cpu` path swaps in a
+HuggingFace `generate()` rollout engine so the *same* loop (including the
+autopsy recorder) runs on an Apple-silicon MacBook with no CUDA or vLLM. See
+[Running locally (Apple Silicon / CPU)](#running-locally-apple-silicon--cpu).
+
 ---
 
 ## Research plan
@@ -53,12 +59,18 @@ checkpoints and seeds.
   - `reinforce_with_baseline` (group-mean baseline, optional std-norm)
   - `grpo_clip` (PPO-style ratio clipping using saved `old_log_probs`)
 - [src/train/run_grpo.py](src/train/run_grpo.py) — full GRPO loop on
-  Countdown: vLLM rollouts → group-normalized advantages → microbatched
+  Countdown: rollouts → group-normalized advantages → microbatched
   policy update → periodic dev eval and rollout-example dumping; supports
   gradient checkpointing, configurable length normalization (`masked_mean` /
-  `masked_normalize`), and the autopsy recorder.
+  `masked_normalize`), the autopsy recorder, and pluggable rollout backends
+  (`--backend cuda|mps|cpu`).
 - [src/train/masking.py](src/train/masking.py) — `masked_mean` and
   `masked_normalize` helpers shared by SFT and GRPO.
+- Both `run_sft.py` and `run_grpo.py` expose `--backend {cuda,mps,cpu}`,
+  `--dtype {bfloat16,float16,float32}`, and `--gen-batch-size`. On CUDA they
+  use vLLM and sync policy weights into it each step; on MPS/CPU they use the
+  HF generator, which holds a live reference to the policy so weight "syncing"
+  is a no-op.
 
 ### Autopsy instrumentation (Phase 1, implemented)
 
@@ -95,6 +107,11 @@ checkpoints and seeds.
   inference with fast/slow grader comparison and category breakdown
   (`correct_format_and_answer`, `formatted_but_wrong`,
   `unformatted_or_unparseable`, suspected parser issues).
+- [src/infer/hf_generate.py](src/infer/hf_generate.py) — local (non-CUDA)
+  rollout backend: a HuggingFace `generate()` wrapper that returns
+  vLLM-`RequestOutput`-shaped objects, so the training loops and autopsy
+  recorder use it as a drop-in replacement for vLLM on MPS/CPU. Handles
+  left-padded batching, stop-string truncation, and greedy/sampling modes.
 
 ### Orchestration scripts
 
@@ -114,7 +131,10 @@ checkpoints and seeds.
   - [scripts/run_grpo_lr_sweep.sh](scripts/run_grpo_lr_sweep.sh) — learning
     rate scan.
 - [scripts/run_autopsy_suite.sh](scripts/run_autopsy_suite.sh) — one-command
-  pilot + full + off-policy autopsy runs across seeds.
+  pilot + full + off-policy autopsy runs across seeds (CUDA).
+- [scripts/run_grpo_local.sh](scripts/run_grpo_local.sh) — Apple-silicon/CPU
+  launcher for GRPO + autopsy (no CUDA/vLLM/W&B); supports `SMOKE=1` for a fast
+  end-to-end sanity run. See [Running locally](#running-locally-apple-silicon--cpu).
 - [scripts/summarize_sft_results.py](scripts/summarize_sft_results.py) and
   [scripts/summarize_grpo_experiments.py](scripts/summarize_grpo_experiments.py)
   — aggregate JSONL histories into per-run summaries.
@@ -234,6 +254,39 @@ Launches:
 
 Useful overrides: `AUTOPSY_OUT_ROOT`, `AUTOPSY_SEEDS`, `WANDB_MODE`,
 `CUDA_DEVICES`, `RUN_PILOT`, `RUN_FULL`, `RUN_OFFPOLICY`.
+
+## Running locally (Apple Silicon / CPU)
+
+The CUDA rollout path depends on vLLM, which is CUDA-only. To run the *same*
+GRPO + autopsy loop on a MacBook (M-series MPS) or CPU, use the HF generate
+backend via [scripts/run_grpo_local.sh](scripts/run_grpo_local.sh):
+
+```bash
+# Fast end-to-end sanity check (2 rollout steps, tiny probe set, short outputs)
+SMOKE=1 bash scripts/run_grpo_local.sh
+
+# Full local run (override anything via env vars)
+NUM_ROLLOUT_STEPS=50 bash scripts/run_grpo_local.sh
+```
+
+Defaults are tuned for an M3 Pro: `Qwen/Qwen2.5-0.5B-Instruct`, `--backend mps`,
+`--dtype float32`, small rollout/group/batch sizes, `--max-new-tokens 256`,
+autopsy enabled, and `--wandb-mode disabled`. The script sets
+`PYTORCH_ENABLE_MPS_FALLBACK=1` so any MPS-unsupported op falls back to CPU
+rather than crashing. Output lands under `runs/local/<run-name>/` with the same
+layout as a CUDA run.
+
+To wire a custom command by hand, the relevant flags are:
+
+- `--backend mps` (or `cpu`) — selects the HF generate rollout engine
+- `--dtype float32` — safest for training on MPS/CPU (bf16 is the CUDA default)
+- `--gen-batch-size` — micro-batch size for HF generation
+
+> **Note on `Qwen2.5-Math`:** there is no public `Qwen2.5-Math-0.5B`, so the
+> small-scale local target is the general-purpose `Qwen/Qwen2.5-0.5B-Instruct`.
+> Mac dependencies (no vllm/wandb/accelerate) live in
+> [pyproject-mac.toml](pyproject-mac.toml); only `numpy`, `torch`,
+> `transformers`, and `datasets` are required for the GRPO/Countdown path.
 
 ## Weights & Biases tracking
 
