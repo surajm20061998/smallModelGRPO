@@ -26,6 +26,10 @@ OLD_LOGPROB_BATCH_SIZE="${OLD_LOGPROB_BATCH_SIZE:-4}"
 
 NUM_ROLLOUT_STEPS="${NUM_ROLLOUT_STEPS:-50}"
 EVAL_EVERY="${EVAL_EVERY:-10}"
+# Eval sets default to A100-scale (256/1024); cap them hard for local runs since
+# greedy eval generation is a major wall-clock cost on MPS.
+DEV_MAX_EXAMPLES="${DEV_MAX_EXAMPLES:-32}"
+TEST_MAX_EXAMPLES="${TEST_MAX_EXAMPLES:-64}"
 
 AUTOPSY_EVERY="${AUTOPSY_EVERY:-5}"
 AUTOPSY_NUM_PROBE_PROMPTS="${AUTOPSY_NUM_PROBE_PROMPTS:-8}"
@@ -82,6 +86,8 @@ python -m src.train.run_grpo \
   --microbatch-size "$MICROBATCH_SIZE" \
   --max-new-tokens "$MAX_NEW_TOKENS" \
   --old-logprob-batch-size "$OLD_LOGPROB_BATCH_SIZE" \
+  --countdown-dev-max-examples "$DEV_MAX_EXAMPLES" \
+  --countdown-test-max-examples "$TEST_MAX_EXAMPLES" \
   --eval-every "$EVAL_EVERY" \
   --gradient-checkpointing \
   --enable-autopsy-recorder \

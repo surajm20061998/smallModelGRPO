@@ -101,9 +101,12 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument(
         "--backend",
-        default="cuda",
-        choices=["cuda", "mps", "cpu"],
-        help="cuda uses vLLM rollouts; mps/cpu use a local HF generate backend (no vLLM).",
+        default="auto",
+        choices=["auto", "cuda", "mps", "cpu"],
+        help=(
+            "auto picks cuda>mps>cpu by what is available. cuda uses vLLM "
+            "rollouts; mps/cpu use a local HF generate backend (no vLLM)."
+        ),
     )
     parser.add_argument(
         "--dtype",
@@ -200,8 +203,37 @@ def init_policy(model_id: str, device: str, gradient_checkpointing: bool, dtype:
     return policy
 
 
+def detect_backend() -> str:
+    """Pick the best available backend: cuda > mps > cpu."""
+    if torch.cuda.is_available():
+        return "cuda"
+    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def require_vllm_available(backend: str) -> None:
+    """Fail fast with a clear message if the cuda backend lacks vLLM."""
+    if backend != "cuda":
+        return
+    import importlib.util
+
+    if importlib.util.find_spec("vllm") is None:
+        raise RuntimeError(
+            "Backend 'cuda' requires vLLM, but it is not importable in this "
+            "environment. Install the CUDA dependency set (e.g. `uv sync` against "
+            "pyproject.toml, not pyproject-mac.toml), or pass --backend mps/cpu to "
+            "use the local HuggingFace generate backend instead."
+        )
+
+
 def resolve_runtime(args) -> tuple[str, str, torch.dtype]:
     backend = args.backend
+    if backend == "auto":
+        backend = detect_backend()
+
+    require_vllm_available(backend)
+
     if backend == "cuda":
         device = args.policy_device
     elif backend == "mps":
@@ -535,6 +567,11 @@ def main() -> None:
     rng = random.Random(args.seed)
 
     backend, device, dtype = resolve_runtime(args)
+    print(
+        f"[run_grpo] backend={backend} (requested {args.backend}) "
+        f"device={device} dtype={str(dtype).replace('torch.', '')}",
+        flush=True,
+    )
 
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True

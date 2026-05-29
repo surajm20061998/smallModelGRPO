@@ -66,11 +66,13 @@ checkpoints and seeds.
   (`--backend cuda|mps|cpu`).
 - [src/train/masking.py](src/train/masking.py) — `masked_mean` and
   `masked_normalize` helpers shared by SFT and GRPO.
-- Both `run_sft.py` and `run_grpo.py` expose `--backend {cuda,mps,cpu}`,
-  `--dtype {bfloat16,float16,float32}`, and `--gen-batch-size`. On CUDA they
-  use vLLM and sync policy weights into it each step; on MPS/CPU they use the
-  HF generator, which holds a live reference to the policy so weight "syncing"
-  is a no-op.
+- Both `run_sft.py` and `run_grpo.py` expose `--backend {auto,cuda,mps,cpu}`,
+  `--dtype {bfloat16,float16,float32}`, and `--gen-batch-size`. The default
+  `auto` picks `cuda > mps > cpu` by availability. On CUDA they use vLLM and
+  sync policy weights into it each step; on MPS/CPU they use the HF generator,
+  which holds a live reference to the policy so weight "syncing" is a no-op.
+  Selecting `--backend cuda` without vLLM installed fails fast with a clear
+  message (rather than a raw `ImportError`).
 
 ### Autopsy instrumentation (Phase 1, implemented)
 
