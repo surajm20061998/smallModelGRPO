@@ -327,6 +327,11 @@ def free_accelerator_memory(backend: str) -> None:
     if backend == "cuda":
         torch.cuda.empty_cache()
     elif backend == "mps":
+        # Autograd-graph objects keep Metal buffers alive until Python GC runs;
+        # collect first so empty_cache can actually return memory to the pool.
+        import gc
+
+        gc.collect()
         try:
             torch.mps.empty_cache()
         except Exception:
@@ -875,6 +880,11 @@ def main() -> None:
                 policy.save_pretrained(snapshot_dir)
                 tokenizer.save_pretrained(snapshot_dir)
 
+        # Release cached generation memory (KV cache blocks) before backward
+        # passes; on MPS the fragmentation otherwise accumulates across steps
+        # until the training backward OOMs.
+        free_accelerator_memory(backend)
+
         policy.train()
         num_examples = tokenized["input_ids"].shape[0]
         for epoch_idx in range(args.epochs_per_rollout_batch):
@@ -963,6 +973,9 @@ def main() -> None:
 
         policy.save_pretrained(last_dir)
         tokenizer.save_pretrained(last_dir)
+
+        # Symmetric release before the next step's generation phase.
+        free_accelerator_memory(backend)
 
         if rollout_step % args.eval_every == 0:
             run_eval(tag=f"rollout_{rollout_step}", rollout_step=rollout_step)

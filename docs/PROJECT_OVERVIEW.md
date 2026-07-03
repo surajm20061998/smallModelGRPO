@@ -337,6 +337,53 @@ policy), exposed a silent numerical bug in the eval path, and motivated a
 principled reward-shaping fix — exactly the class of failure this
 instrumentation was built to catch.
 
+Two more MPS engineering fixes were needed to get the rerun through: the
+backward pass OOM'd around step 30 because Metal-side memory ("other
+allocations": kernel/graph caches plus GC-delayed autograd objects) grows
+across steps — fixed with `gc.collect()` before `torch.mps.empty_cache()` at
+the generation↔training phase boundaries, and by lifting the MPS allocator's
+high-watermark cap (`PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0`) in the local
+launcher. The no-padding generator also turned out to be ~2.5× faster
+(~1.3 min/rollout-step vs ~3.5), since padded tokens were pure overhead.
+
+### Std-norm ablation results (v4, local M3 Pro)
+
+Setup: `Qwen2.5-0.5B-Instruct`, 45 rollout steps, seed 42, group size 4,
+8 rollouts/step, shaped reward `answer + 0.2·format`, identical fixed probe
+set; the **only** difference between arms is `--normalize-by-std`. Full
+tables: `runs/local/stdnorm_v4_comparison.md` and each run's
+`analysis/report.md`.
+
+| metric | std-norm ON | std-norm OFF |
+| --- | --- | --- |
+| probe format rate (first → last) | 0.59 → **0.00** (collapse) | 0.66 → **1.00** (mastery) |
+| final dev format rate | 0.0 | 1.0 |
+| train grad-norm (mean / max) | 2.92 / 13.1 | 0.18 / 2.8 |
+| probe mean length (first → last) | 90 → 79 tokens (rambling) | 68 → 12 tokens (terse answers) |
+| entropy slope, overall | +0.0023 (drifts up) | −0.0064 (healthy collapse) |
+| entropy slope, text vs operator tokens | +0.002 / +0.008 | **−0.012 / +0.002** |
+
+Readings (n=1 seed, 0.5B model — treat as a demonstration, not a law):
+
+1. **Hypothesis 4 supported dramatically.** With sparse binary-ish rewards
+   and group size 4, a group where one rollout formats has tiny reward std;
+   dividing by `(std + ε)` amplifies that advantage into enormous updates
+   (16× larger mean grad-norm), and the std-norm arm *destroys* the format
+   behavior it had at initialization. The unnormalized arm learns format to
+   100% smoothly. This is the Dr. GRPO amplification pathology reproduced at
+   laptop scale.
+2. **A reward-shaping hack surfaced (H1-adjacent).** The successful arm
+   drove response length 68 → 12 tokens: it emits minimal `<answer>` blocks
+   that earn the format credit without solving anything — optimizing the
+   proxy, not the task. Next intervention: decay the format weight over
+   steps, or gate it on nonzero answer reward.
+3. **Entropy collapse is asymmetric (H3 signal).** In the learning arm,
+   text-token entropy collapses fastest (−0.012/step) while operator-token
+   entropy *rises* slightly — the model commits to the scaffold first and
+   keeps exploring the arithmetic. The collapsing arm shows the opposite
+   (entropy drifting up everywhere) — a degeneration signature, not
+   exploration.
+
 ## 11. What is deliberately NOT here
 
 - KL penalty to a reference model — matches R1-Zero-style minimal GRPO; noted

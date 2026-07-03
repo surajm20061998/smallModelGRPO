@@ -59,6 +59,10 @@ OUTPUT_DIR="${OUTPUT_DIR:-$OUT_ROOT/$RUN_NAME}"
 # Allow CPU fallback for any MPS-unsupported op rather than hard-failing.
 export PYTORCH_ENABLE_MPS_FALLBACK="${PYTORCH_ENABLE_MPS_FALLBACK:-1}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
+# Disable the MPS allocator's high-watermark cap: long runs accumulate Metal
+# kernel/graph cache ("other allocations") and the default cap kills backward
+# with OOM even when unified memory + swap could absorb the peak.
+export PYTORCH_MPS_HIGH_WATERMARK_RATIO="${PYTORCH_MPS_HIGH_WATERMARK_RATIO:-0.0}"
 
 echo "========================================"
 echo "Local GRPO run"
