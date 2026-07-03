@@ -149,6 +149,8 @@ def grpo_microbatch_train_step(
     cliprange: float | None = None,
     length_normalization: Literal["masked_mean", "masked_normalize"] = "masked_mean",
     normalize_constant: float | None = None,
+    entropy_bonus_coef: float = 0.0,
+    token_entropy: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     per_token_loss, metadata = compute_policy_gradient_loss(
         policy_log_probs=policy_log_probs,
@@ -158,6 +160,15 @@ def grpo_microbatch_train_step(
         old_log_probs=old_log_probs,
         cliprange=cliprange,
     )
+
+    if entropy_bonus_coef and entropy_bonus_coef != 0.0:
+        assert token_entropy is not None, (
+            "token_entropy (differentiable, from the policy forward pass) is "
+            "required when entropy_bonus_coef is non-zero"
+        )
+        # Maximize entropy: subtract the bonus from the loss. token_entropy must
+        # retain its graph back to the logits for the bonus to produce gradient.
+        per_token_loss = per_token_loss - entropy_bonus_coef * token_entropy
 
     if length_normalization == "masked_mean":
         per_example_loss = masked_mean(
@@ -184,6 +195,12 @@ def grpo_microbatch_train_step(
     metadata = dict(metadata)
     metadata["per_example_loss"] = per_example_loss.detach()
     metadata["mean_loss"] = loss.detach()
+    if token_entropy is not None:
+        metadata["mean_token_entropy"] = masked_mean(
+            tensor=token_entropy.detach(),
+            mask=response_mask,
+            dim=None,
+        )
     if normalize_constant is not None:
         metadata["normalize_constant"] = torch.tensor(
             normalize_constant,

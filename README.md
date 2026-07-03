@@ -62,8 +62,13 @@ checkpoints and seeds.
   Countdown: rollouts → group-normalized advantages → microbatched
   policy update → periodic dev eval and rollout-example dumping; supports
   gradient checkpointing, configurable length normalization (`masked_mean` /
-  `masked_normalize`), the autopsy recorder, and pluggable rollout backends
-  (`--backend cuda|mps|cpu`).
+  `masked_normalize`), an optional entropy-maximization bonus
+  (`--entropy-bonus-coef`, differentiable full-vocab entropy added to the
+  loss — an exploration intervention targeting entropy collapse), shaped
+  training reward (`--format-reward-weight w`: `reward = answer + w·format`,
+  a cold-start fix that creates group reward variance before the model can
+  solve anything; eval metrics stay pure), the autopsy recorder, and
+  pluggable rollout backends (`--backend auto|cuda|mps|cpu`).
 - [src/train/masking.py](src/train/masking.py) — `masked_mean` and
   `masked_normalize` helpers shared by SFT and GRPO.
 - Both `run_sft.py` and `run_grpo.py` expose `--backend {auto,cuda,mps,cpu}`,
@@ -91,6 +96,29 @@ checkpoints and seeds.
   (scalar log), and periodic checkpoint snapshots in
   `checkpoints/autopsy_step_XXXX/`.
 
+### Phase-2 analysis pipeline (implemented)
+
+Consumes a run's autopsy artifacts and writes per-hypothesis JSON metrics plus
+a markdown report to `<run-dir>/analysis/`:
+
+- [src/analysis/loading.py](src/analysis/loading.py) — flattens per-probe
+  rollout JSONs into per-rollout records.
+- [src/analysis/length_vs_reward.py](src/analysis/length_vs_reward.py) — H1:
+  per-step length distributions conditioned on reward, plus length-vs-step
+  slopes per population and per difficulty bucket.
+- [src/analysis/behaviors.py](src/analysis/behaviors.py) — H2: regex detector
+  families (backtracking / verification / case analysis), per-step rollout
+  frequencies.
+- [src/analysis/entropy.py](src/analysis/entropy.py) — H3: mean token entropy
+  bucketed by response position (early/mid/late), token type
+  (number/operator/structure/text), and rollout correctness, with an
+  entropy-vs-step slope per bucket.
+- [src/analysis/run_analysis.py](src/analysis/run_analysis.py) — per-run CLI:
+  `python -m src.analysis.run_analysis --run-dir runs/local/<name>`.
+- [src/analysis/compare_runs.py](src/analysis/compare_runs.py) — A/B ablation
+  comparison table:
+  `python -m src.analysis.compare_runs --run-dirs <runA> <runB>`.
+
 ### Reward functions
 
 - [src/grading/grader_math.py](src/grading/grader_math.py) — boxed-answer
@@ -113,7 +141,10 @@ checkpoints and seeds.
   rollout backend: a HuggingFace `generate()` wrapper that returns
   vLLM-`RequestOutput`-shaped objects, so the training loops and autopsy
   recorder use it as a drop-in replacement for vLLM on MPS/CPU. Handles
-  left-padded batching, stop-string truncation, and greedy/sampling modes.
+  stop-string truncation and greedy/sampling modes. Batches only
+  equal-length prompts together (never pads): padded mixed-length batches
+  produce NaN logits under SDPA on MPS, which crashes sampled generation and
+  silently corrupts greedy decoding.
 
 ### Orchestration scripts
 
@@ -170,14 +201,11 @@ These are placeholders left for follow-on phases of the autopsy work.
   — empty file.
 - **`scripts/eval_all.sh`** — empty file (no aggregated post-training eval
   pipeline yet).
-- **Phase-2 analysis pipeline** — the recorder produces raw artifacts, but
-  the analyses that consume them are not in the repo yet:
-  - length-vs-reward / length-vs-step plots
-  - regex-based reasoning-behavior detectors (backtracking, verification,
-    case analysis) and the LLM-judge precision/recall layer
-  - per-bucket entropy-slope analysis (token position, token type,
-    correctness)
-  - cross-seed and cross-loss-type aggregation reports
+- **LLM-judge validation layer** for the behavior regex detectors
+  (precision/recall calibration; regex counts are reported as-is today).
+- **Cross-seed aggregation reports** — `compare_runs.py` compares individual
+  runs; multi-seed variance bands are not automated yet.
+- **Plots** — the analysis module emits JSON + markdown tables, not figures.
 - **Off-policy importance-ratio analysis** beyond raw clipfrac logging.
 - **CLI/Notebook viewers** for the saved `rollout_tensors.pt` bundles.
 
@@ -192,6 +220,8 @@ These are placeholders left for follow-on phases of the autopsy work.
 | `uv run python -m src.train.run_grpo` | GRPO training on Countdown + autopsy |
 | `uv run python -m src.infer.infer_batch` | Batched MATH inference w/ category report |
 | `uv run python -m src.eval.evaluate_math` | Quick MATH/Intellect accuracy probe |
+| `python -m src.analysis.run_analysis --run-dir <dir>` | Phase-2 autopsy analysis (H1–H3 report) |
+| `python -m src.analysis.compare_runs --run-dirs <a> <b>` | A/B ablation comparison table |
 
 ## Phase-1 autopsy: recommended pilot command
 

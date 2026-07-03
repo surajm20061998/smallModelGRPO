@@ -85,6 +85,28 @@ def parse_args() -> argparse.Namespace:
         default="masked_mean",
         choices=["masked_mean", "masked_normalize"],
     )
+    parser.add_argument(
+        "--format-reward-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Shaped training reward: reward = answer_reward + w * format_reward. "
+            "Gives partial credit for emitting a well-formed <answer> block, which "
+            "creates group-level reward variance when correct answers are still rare "
+            "(cold-start fix for small models). 0 keeps the pure answer reward. "
+            "Eval metrics are unaffected."
+        ),
+    )
+    parser.add_argument(
+        "--entropy-bonus-coef",
+        type=float,
+        default=0.0,
+        help=(
+            "If non-zero, subtract coef * per-token policy entropy from the loss "
+            "(entropy maximization bonus, A3C/PPO-style). 0 disables and skips the "
+            "extra entropy computation entirely."
+        ),
+    )
 
     parser.add_argument("--rollout-temperature", type=float, default=0.7)
     parser.add_argument("--rollout-top-p", type=float, default=1.0)
@@ -201,6 +223,25 @@ def init_policy(model_id: str, device: str, gradient_checkpointing: bool, dtype:
         policy.gradient_checkpointing_enable()
     policy.config.use_cache = False
     return policy
+
+
+def make_train_reward_fn(format_reward_weight: float):
+    """Training reward, optionally shaped with partial credit for format.
+
+    The recorder and all eval paths keep the pure countdown reward; only the
+    advantage computation sees the shaped scalar.
+    """
+    if format_reward_weight == 0.0:
+        return countdown_reward_fn
+
+    def shaped_reward_fn(response, ground_truth):
+        reward = countdown_reward_fn(response, ground_truth)
+        return {
+            **reward,
+            "reward": reward["answer_reward"] + format_reward_weight * reward["format_reward"],
+        }
+
+    return shaped_reward_fn
 
 
 def detect_backend() -> str:
@@ -572,6 +613,7 @@ def main() -> None:
         f"device={device} dtype={str(dtype).replace('torch.', '')}",
         flush=True,
     )
+    train_reward_fn = make_train_reward_fn(args.format_reward_weight)
 
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -754,7 +796,7 @@ def main() -> None:
         ]
 
         advantages, raw_rewards, reward_metadata = compute_group_normalized_rewards(
-            reward_fn=countdown_reward_fn,
+            reward_fn=train_reward_fn,
             rollout_responses=rollout_responses,
             repeated_ground_truths=repeated_ground_truths,
             group_size=args.group_size,
@@ -845,18 +887,21 @@ def main() -> None:
 
                 micro_loss_total = 0.0
                 clipfrac_values = []
+                entropy_values = []
+                use_entropy_bonus = args.entropy_bonus_coef != 0.0
 
                 for micro_indices in microbatches:
                     current_input_ids = tokenized["input_ids"][micro_indices].to(device)
                     current_labels = tokenized["labels"][micro_indices].to(device)
                     current_response_mask = tokenized["response_mask"][micro_indices].to(device)
 
-                    current_log_probs = get_response_log_probs(
+                    scored = get_response_log_probs(
                         model=policy,
                         input_ids=current_input_ids,
                         labels=current_labels,
-                        return_token_entropy=False,
-                    )["log_probs"]
+                        return_token_entropy=use_entropy_bonus,
+                    )
+                    current_log_probs = scored["log_probs"]
 
                     loss, metadata = grpo_microbatch_train_step(
                         policy_log_probs=current_log_probs,
@@ -872,11 +917,17 @@ def main() -> None:
                         ),
                         cliprange=args.cliprange if args.loss_type == "grpo_clip" else None,
                         length_normalization=args.length_normalization,
+                        entropy_bonus_coef=args.entropy_bonus_coef,
+                        token_entropy=scored.get("token_entropy"),
                     )
 
                     micro_loss_total += float(loss.detach().cpu().item())
                     if "clipfrac" in metadata:
                         clipfrac_values.append(float(metadata["clipfrac"].detach().cpu().item()))
+                    if "mean_token_entropy" in metadata:
+                        entropy_values.append(
+                            float(metadata["mean_token_entropy"].detach().cpu().item())
+                        )
 
                 grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), args.max_grad_norm)
                 optimizer.step()
@@ -894,6 +945,10 @@ def main() -> None:
                     "train/lr": optimizer.param_groups[0]["lr"],
                     "train/grad_norm": float(grad_norm.detach().cpu().item()) if torch.is_tensor(grad_norm) else float(grad_norm),
                     "train/clipfrac": float(sum(clipfrac_values) / len(clipfrac_values)) if clipfrac_values else 0.0,
+                    "train/entropy_bonus_coef": args.entropy_bonus_coef,
+                    "train/mean_token_entropy": (
+                        float(sum(entropy_values) / len(entropy_values)) if entropy_values else None
+                    ),
                     "train/reward_mean": reward_metadata["reward_mean"],
                     "train/answer_reward_mean": reward_metadata["answer_reward_mean"],
                     "train/advantage_mean": float(advantages.mean().item()),

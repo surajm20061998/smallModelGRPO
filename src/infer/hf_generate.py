@@ -87,55 +87,60 @@ class HFGenerator:
         do_sample = temperature > 0.0
 
         tokenizer = self.tokenizer
-        prev_padding_side = tokenizer.padding_side
         prev_use_cache = getattr(self.model.config, "use_cache", None)
         was_training = self.model.training
 
-        tokenizer.padding_side = "left"
         self.model.config.use_cache = True
         self.model.eval()
 
-        results: list[_HFRequestOutput] = []
+        # Batch only equal-length prompts together so padding is never needed.
+        # Padded mixed-length batches produce NaN logits in SDPA on the MPS
+        # backend (sampled generation then crashes in torch.multinomial; greedy
+        # decoding silently corrupts instead). Rollout groups repeat a single
+        # prompt so this costs nothing there; mixed-length eval batches degrade
+        # to per-length chunks.
+        ids_list = tokenizer(prompts, add_special_tokens=False)["input_ids"]
+        by_length: dict[int, list[int]] = {}
+        for idx, ids in enumerate(ids_list):
+            by_length.setdefault(len(ids), []).append(idx)
+
+        gen_kwargs: dict[str, Any] = {
+            "max_new_tokens": max_new_tokens,
+            "do_sample": do_sample,
+            "pad_token_id": tokenizer.pad_token_id,
+        }
+        if min_new_tokens > 0:
+            gen_kwargs["min_new_tokens"] = min_new_tokens
+        if do_sample:
+            gen_kwargs["temperature"] = temperature
+            gen_kwargs["top_p"] = top_p
+        if stop:
+            gen_kwargs["stop_strings"] = list(stop)
+            gen_kwargs["tokenizer"] = tokenizer
+
+        results: list[_HFRequestOutput | None] = [None] * len(prompts)
         try:
-            for start in range(0, len(prompts), self.batch_size):
-                batch = prompts[start : start + self.batch_size]
-                encoded = tokenizer(
-                    batch,
-                    return_tensors="pt",
-                    padding=True,
-                    add_special_tokens=False,
-                )
-                input_ids = encoded["input_ids"].to(self.device)
-                attention_mask = encoded["attention_mask"].to(self.device)
+            for indices in by_length.values():
+                for start in range(0, len(indices), self.batch_size):
+                    chunk = indices[start : start + self.batch_size]
+                    input_ids = torch.tensor(
+                        [ids_list[i] for i in chunk], dtype=torch.long
+                    ).to(self.device)
+                    attention_mask = torch.ones_like(input_ids)
 
-                gen_kwargs: dict[str, Any] = {
-                    "max_new_tokens": max_new_tokens,
-                    "do_sample": do_sample,
-                    "pad_token_id": tokenizer.pad_token_id,
-                }
-                if min_new_tokens > 0:
-                    gen_kwargs["min_new_tokens"] = min_new_tokens
-                if do_sample:
-                    gen_kwargs["temperature"] = temperature
-                    gen_kwargs["top_p"] = top_p
-                if stop:
-                    gen_kwargs["stop_strings"] = list(stop)
-                    gen_kwargs["tokenizer"] = tokenizer
-
-                generated = self.model.generate(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    **gen_kwargs,
-                )
-                new_tokens = generated[:, input_ids.shape[1] :]
-                texts = tokenizer.batch_decode(new_tokens, skip_special_tokens=True)
-
-                for text in texts:
-                    final_text, finish_reason, stop_reason = self._apply_stop(
-                        text, stop, include_stop
+                    generated = self.model.generate(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        **gen_kwargs,
                     )
-                    results.append(
-                        _HFRequestOutput(
+                    new_tokens = generated[:, input_ids.shape[1] :]
+                    texts = tokenizer.batch_decode(new_tokens, skip_special_tokens=True)
+
+                    for prompt_idx, text in zip(chunk, texts):
+                        final_text, finish_reason, stop_reason = self._apply_stop(
+                            text, stop, include_stop
+                        )
+                        results[prompt_idx] = _HFRequestOutput(
                             outputs=[
                                 _HFCompletion(
                                     text=final_text,
@@ -144,12 +149,10 @@ class HFGenerator:
                                 )
                             ]
                         )
-                    )
         finally:
-            tokenizer.padding_side = prev_padding_side
             if prev_use_cache is not None:
                 self.model.config.use_cache = prev_use_cache
             if was_training:
                 self.model.train()
 
-        return results
+        return results  # type: ignore[return-value]
