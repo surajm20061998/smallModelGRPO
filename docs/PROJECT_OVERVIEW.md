@@ -2,6 +2,8 @@
 
 End-to-end walkthrough of this repository: purpose, research plan, architecture,
 algorithms, and the engineering tradeoffs behind each design decision.
+For mock-interview Q&A with defenses of every decision below, see
+[INTERVIEW_PREP.md](INTERVIEW_PREP.md).
 
 ---
 
@@ -106,7 +108,28 @@ shift — `input_ids = full[:, :-1]`, `labels = full[:, 1:]`, mask aligned to
 labels. Every loss in the repo (SFT and GRPO) is computed per-token then
 reduced under this mask, so prompt tokens and padding never receive gradient.
 Log-probs are `log_softmax(logits).gather(-1, labels)`; entropy is exact over
-the full vocab (`−Σ p log p`), not a sampled estimate.
+the full vocab (`−Σ p log p`), not a sampled estimate. Prompt and response
+are tokenized *separately* then concatenated — this can differ from
+tokenizing the joined string at the boundary token, but it is consistent
+between training and scoring, which is what correctness requires.
+
+**Stop-sequence handling.** Generation stops on `</answer>` (the
+`--stop-sequence` flag). Engines exclude the matched stop string from output
+by default, but the grader's regex needs the closing tag present, so
+`get_output_text` re-appends it when `finish_reason == "stop"` and the stop
+reason matches. Both the vLLM path and `HFGenerator` expose the same
+`finish_reason`/`stop_reason` fields so this logic is backend-agnostic.
+
+**Run outputs.** Every run writes a self-describing directory: `config.json`
+(the full flag snapshot — the reproducibility record), append-only JSONL
+histories (`train_history`, `rollout_history`, `eval_history`,
+`rollout_examples` with a few sampled generations per step), `summary.json`
+(best/final metrics), `best_metric.json`, and `checkpoints/{best,last}` plus
+optional periodic `autopsy_step_XXXX` snapshots. Best-checkpoint selection is
+on dev accuracy; the final test evaluation reloads `best`, not `last`.
+Training-signal metrics logged per optimizer step include loss, grad-norm,
+clipfrac (grpo_clip), advantage mean/std, and — when the entropy bonus is
+active — mean token entropy.
 
 ## 5. The GRPO math
 
@@ -157,6 +180,39 @@ entropy-slope analysis. β=0 (default) is a no-op and preserves prior behavior.
 itself (loss pre-divided by accumulation steps) inside the step function; the
 driver clips grad-norm and calls `optimizer.step()` once per train batch.
 Microbatch size 1 + gradient checkpointing was the memory posture on A100.
+One correctness edge handled in SFT: the final partial accumulation window
+rescales by the *actual* number of remaining microbatches, so the last
+optimizer step of an epoch is not systematically down-weighted.
+
+## 5b. The SFT stage
+
+[src/train/run_sft.py](../src/train/run_sft.py) +
+[src/train/sft.py](../src/train/sft.py) +
+[src/train/tune_sft.py](../src/train/tune_sft.py).
+
+- **Loss**: `sft_microbatch_train_step` — negative mean of per-example
+  response log-prob sums, computed under the response mask via
+  `masked_normalize` (sum divided by a `normalize_constant`, default 1.0),
+  divided by the accumulation count before `backward()`. Standard
+  teacher-forced NLL restricted to response tokens.
+- **Data**: Intellect-Math chat traces (`messages` with system/user/assistant
+  roles) flattened into `prompt` (system + user) and `output` (assistant),
+  with `ground_truth` carried for eval. Data-scaling runs subsample train to
+  n ∈ {128, 256, 512, 1024, full}.
+- **Evaluation**: two eval families each cycle — held-out Intellect dev, and
+  MATH (hiyouga/math12k) val — graded by the vendored boxed-answer/SymPy
+  verifier, with category accounting (`formatted_but_wrong`, `unformatted`)
+  to separate parsing failures from reasoning failures. Best checkpoint is
+  selected on `--selection-metric` (default `math_val_accuracy`).
+- **Hyperparameter search**: `tune_sft.py` grid over
+  (lr, microbatch, grad-accum) triples emits `best_config.json`, consumed by
+  [scripts/train_all.sh](../scripts/train_all.sh) for the scaling sweep.
+- The same backend flags (`--backend/--dtype/--gen-batch-size`) were threaded
+  through SFT as GRPO, so the SFT loop is also runnable locally — though the
+  full SFT recipe (seq len up to 2048, 300 optimizer steps × 16 grad-accum,
+  500-example evals) is ~12+ h on the M3 Pro and was deliberately skipped
+  locally: `Qwen2.5-0.5B-Instruct` is already instruction-tuned and the
+  autopsy research questions live in the GRPO stage.
 
 ## 6. Autopsy recorder (the core instrumentation)
 
@@ -182,6 +238,16 @@ every `autopsy_every` rollout steps:
    training and should degrade rather than kill an 8-hour run.
 6. Periodic full HF checkpoint snapshots (`checkpoints/autopsy_step_XXXX/`) so
    analyses not anticipated up front can be recomputed later.
+
+**Probe-set construction**
+([src/autopsy/probe_set.py](../src/autopsy/probe_set.py)): difficulty rule —
+`easy` = ≤3 numbers and target ≤50, `hard` = ≥4 numbers and target ≥250,
+`medium` = everything else; targets ~34/33/33 with shortfall backfilled from
+the remaining pool; a dedicated probe RNG seed (default 123, independent of
+the training seed) makes the same probe set reproducible across runs and
+arms. Each `ProbeExample` is a frozen dataclass carrying probe_id, dataset
+index, formatted prompt, ground truth, and difficulty metadata — all
+serialized into the manifest.
 
 Design principle: **record raw signal, defer analysis.** The recorder saves
 everything needed to test all four hypotheses; the consumers live in the
@@ -223,6 +289,25 @@ Components:
   `analysis/report.md` into the run dir; `compare_runs.py` renders a
   side-by-side table for A/B ablations (e.g., std-norm on vs off).
 
+Implementation notes worth knowing cold:
+
+- **Statistics** ([stats.py](../src/analysis/stats.py)) are dependency-free:
+  interpolated quantiles and ordinary least-squares slopes (returning
+  `slope=None` for n<2 or zero x-variance rather than crashing on degenerate
+  windows).
+- **Token-type classification** handles Qwen's GPT-2-style byte-BPE surface
+  forms: strip the `Ġ` (space) and `Ċ` (newline) markers, then classify —
+  all-digits → number, all chars in `+-*/×÷=()` → operator, answer-scaffold
+  tokens (`<answer>`, `step`, `:`, whitespace) → structure, else text. It is
+  a heuristic validated by inspection, not a ground-truth labeling — stated
+  as such wherever results depend on it.
+- **Fair A/B windows**: `--max-step` trims runs to a common step range (used
+  when one arm died later than another); in trim mode `compare_runs` computes
+  in memory rather than clobbering the persisted full analysis.
+- Behavior detectors are surface regexes; the planned LLM-judge layer for
+  precision/recall calibration is future work, so behavior *trends* are more
+  trustworthy than absolute frequencies.
+
 The module is pure-Python over the JSON artifacts (torch only for optional
 tensor loading), so it runs anywhere — including on artifacts regenerated
 locally on a laptop.
@@ -263,22 +348,86 @@ were lost. vLLM is CUDA-only, so the rollout engine was abstracted:
 - [src/infer/hf_generate.py](../src/infer/hf_generate.py) — `HFGenerator`
   wraps HF `generate()` but returns **vLLM-`RequestOutput`-shaped objects**
   (`out.outputs[0].text/.finish_reason/.stop_reason`), so the training loop,
-  eval, and recorder needed *zero* call-site changes. Handles left-padded
-  batching (decoder-only requirement), stop-string truncation, and
-  greedy/sampling modes.
+  eval, and recorder needed *zero* call-site changes. Handles stop-string
+  truncation and greedy/sampling modes.
+- **It never pads.** Prompts are grouped by exact token length and only
+  equal-length prompts are batched together (original order restored on
+  return). This exists because padded mixed-length batches produce NaN
+  logits under SDPA on MPS — see the post-mortem in §10 — and it doubled as
+  a ~2.5× speedup, since pad tokens were pure compute overhead. Rollout
+  groups repeat one prompt, so they always batch at full width; mixed-length
+  eval batches degrade to per-length chunks.
 - `HFGenerator` holds a **live reference to the policy module** — the vLLM
   weight-sync step becomes a no-op locally. One model in memory instead of two.
 - `--backend {auto,cuda,mps,cpu}` with `auto` (default) detecting
   cuda > mps > cpu; a fail-fast guard raises a clear error if cuda is selected
   without vLLM installed. dtype defaults: bf16 on cuda, **fp32 on MPS/CPU**
   (bf16 training on MPS is numerically risky / poorly supported).
+- **MPS memory discipline**: `free_accelerator_memory` runs `gc.collect()`
+  before `torch.mps.empty_cache()` (autograd-graph objects pin Metal buffers
+  until Python GC runs) and is called at the generation↔training phase
+  boundaries of every rollout step; the local launcher lifts the MPS
+  allocator's high-watermark cap (`PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0`)
+  because Metal-side kernel/graph caches ("other allocations") grow across a
+  long run and the default cap kills backward passes that unified memory
+  could absorb.
 - Model downscaled to `Qwen/Qwen2.5-0.5B-Instruct` (no public Math-0.5B
   exists), batch sizes shrunk, eval sets capped (32/64 instead of 256/1024 —
   measured: greedy eval was the dominant local wall-clock cost), W&B off.
-- Verified end-to-end: a 2-step smoke run on MPS produced the full artifact
-  tree. Measured throughput: ~89 tok/s generation (batch 4, 256 new tokens),
-  ~1.5 s per train microbatch → ~1–1.5 min per rollout step, so a 60-step
-  autopsy run ≈ 1–1.5 h locally.
+- [scripts/run_grpo_local.sh](../scripts/run_grpo_local.sh) is the local
+  launcher: M3-sane defaults, every knob an env-var override, a `SMOKE=1`
+  mode (2 steps, tiny probes) for end-to-end sanity in ~15 min, and
+  `PYTORCH_ENABLE_MPS_FALLBACK=1` so unsupported ops fall back to CPU
+  instead of crashing.
+- **Measured performance** (M3 Pro, 0.5B fp32): ~89 tok/s aggregate
+  generation (batch 4, 256 new tokens), ~1.5 s per training microbatch
+  (bs=1, seq≈320, grad checkpointing). Real rollout steps: ~3.5 min with the
+  original padded generator, **~1.3 min after the no-padding fix** — a
+  45-step autopsy run completes in ~35 min.
+- **Environment**: the working local env is conda Python 3.13 + torch 2.8
+  (MPS) + transformers 4.55 + datasets — only four packages matter for the
+  GRPO/Countdown path (sympy/math-verify are SFT-grader-only).
+  `pyproject-mac.toml` (no vllm/wandb/accelerate) exists for a
+  from-scratch uv setup; the CUDA dependency set lives in `pyproject.toml`.
+- **Ops lesson learned the hard way**: fp32 checkpoints of even a 0.5B are
+  ~2 GB, and per-step `last` saves plus every-25-step snapshots filled the
+  disk mid-run. Local ablations run with snapshots disabled
+  (`AUTOPSY_CHECKPOINT_EVERY=0`), and `runs/` is gitignored.
+
+## 9b. Data, tracking, and supporting tooling
+
+- **Data bootstrap** ([src/data_bootstrap.py](../src/data_bootstrap.py)):
+  if `data-distrib/` is missing but `data.tgz` is present, required dataset
+  files are extracted lazily on first use, through a **path-traversal-safe
+  extractor** (member paths are resolved and checked against the target root
+  before extraction). A fresh clone with the tarball trains with no manual
+  setup step.
+- **Prompts** live in `configs/prompts/` — `countdown.prompt` instructs
+  step-by-step reasoning and the `<answer>…</answer>` output contract (both
+  the step-list and single-equation forms are shown by example);
+  `intellect.prompt` is the MATH-style template.
+- **Experiment tracking**: W&B (`entity sm12377-new-york-university`,
+  project `smallModelGrpo`) with `define_metric` so `train/*` and `eval/*`
+  chart against their own step counters, and optional upload of the entire
+  output dir as a run artifact. Every W&B record is *also* written to local
+  JSONL first — the runs never depend on the tracker being up, which is why
+  local runs simply set `--wandb-mode disabled`.
+- **Standalone inference/eval tools**:
+  [src/infer/infer_batch.py](../src/infer/infer_batch.py) (batched MATH
+  inference with fast/slow grader comparison and a category breakdown that
+  separates parser failures from reasoning failures) and
+  [src/eval/evaluate_math.py](../src/eval/evaluate_math.py) (quick
+  Intellect/MATH accuracy probe). Both are vLLM-based utility scripts from
+  the A100 phase.
+- **Orchestration scripts** (`scripts/`): `train_all.sh` (SFT tune + scaling
+  sweep), `benchmark_all.sh` (on-policy GRPO reference),
+  `run_grpo_{baseline,lengthnorm,stdnorm,lr}_sweep.sh` (one ablation axis
+  each), `run_grpo_offpolicy.sh` (grpo_clip contrast),
+  `run_autopsy_suite.sh` (pilot + full + off-policy × seeds, one command),
+  `run_grpo_local.sh` (Mac), `summarize_{sft_results,grpo_experiments}.py`
+  (JSONL → per-run summaries), and GPU keep-alive utilities for cloud
+  instances that reclaim idle GPUs. All accept env-var overrides rather than
+  requiring edits.
 
 ## 10. Experiments
 
@@ -296,9 +445,9 @@ lives in the orchestration scripts and the runs are being regenerated locally:
 - **Autopsy suite** (A100): pilots (20 steps) + full runs (200 steps) × seeds
   {42, 43, 44} + off-policy contrast — multi-seed because small-scale RL is
   noisy and single-seed dynamics claims are weak.
-- **Local ablations** (M3 Pro, current): std-norm on/off at 60 steps with
-  identical seeds/probe sets (hypothesis 4), analyzed with the Phase-2 module;
-  entropy-bonus ablation available via `--entropy-bonus-coef`.
+- **Local ablations** (M3 Pro, current): std-norm on/off at 45 steps with
+  identical seeds/probe sets (hypothesis 4) — results below; entropy-bonus
+  ablation available via `--entropy-bonus-coef` as the next arm.
 
 ### The v1 ablation post-mortem (a case study in why the autopsy exists)
 
@@ -337,14 +486,23 @@ policy), exposed a silent numerical bug in the eval path, and motivated a
 principled reward-shaping fix — exactly the class of failure this
 instrumentation was built to catch.
 
-Two more MPS engineering fixes were needed to get the rerun through: the
-backward pass OOM'd around step 30 because Metal-side memory ("other
-allocations": kernel/graph caches plus GC-delayed autograd objects) grows
-across steps — fixed with `gc.collect()` before `torch.mps.empty_cache()` at
-the generation↔training phase boundaries, and by lifting the MPS allocator's
-high-watermark cap (`PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0`) in the local
-launcher. The no-padding generator also turned out to be ~2.5× faster
-(~1.3 min/rollout-step vs ~3.5), since padded tokens were pure overhead.
+Getting the rerun through took two more attempts, which is itself
+instructive. Once real gradients flowed, the training backward OOM'd at step
+~28 on a 519 MiB allocation (exactly one fp32 logits buffer: ~890 tokens ×
+152k vocab × 4 B). Attempt one — `torch.mps.empty_cache()` at the
+generation↔training phase boundaries — moved the failure from step 28 to
+step 30: the growing term was "other allocations" (Metal-side kernel/graph
+caches plus autograd objects whose Metal buffers are pinned until Python GC
+runs), which `empty_cache` cannot touch. Attempt two fixed it:
+`gc.collect()` *before* `empty_cache()` (so buffers are actually
+reclaimable) plus lifting the MPS allocator's high-watermark cap
+(`PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0`) in the local launcher, and
+de-risking 60→45 steps (slope estimation needs ~9 snapshots, not 12). The
+no-padding generator also turned out to be ~2.5× faster
+(~1.3 min/rollout-step vs ~3.5), since padded tokens were pure overhead —
+both 45-step arms completed in ~35 minutes each. A disk-full crash along the
+way (2 GB fp32 checkpoints × per-step `last` saves + periodic snapshots on a
+laptop) is why local ablations run with snapshots disabled.
 
 ### Std-norm ablation results (v4, local M3 Pro)
 
@@ -389,11 +547,24 @@ Readings (n=1 seed, 0.5B model — treat as a demonstration, not a law):
 - KL penalty to a reference model — matches R1-Zero-style minimal GRPO; noted
   as a known design choice (the entropy bonus was chosen as the exploration
   intervention instead, since it needs no second model in memory — which
-  matters on a laptop).
+  matters on a laptop). It is also a scientific choice: a KL leash would
+  mask exactly the instabilities (e.g., the std-norm collapse) this project
+  measures.
+- **Resume-from-checkpoint** — exact RL resume requires restoring policy,
+  optimizer state, data-order RNG, *and* generation RNG to be trajectory-
+  faithful; a non-bitwise resume injects an invisible discontinuity into
+  every longitudinal autopsy series. At 35–90-minute local runs,
+  restart-from-scratch was the cheaper correctness guarantee. First thing to
+  build for A100-scale sweeps.
 - LLM-judge validation of the behavior regexes (planned; regex counts are
   reported as-is).
+- Cross-seed aggregation with variance bands (`compare_runs` compares
+  individual runs today).
+- Plots — the analysis emits JSON + markdown tables; figures are generated
+  ad hoc.
 - Config YAMLs, `infer_single.py`, `benchmarks.py`, `eval_all.sh` — empty
-  placeholders; everything is CLI-flag configured.
+  placeholders; everything is CLI-flag configured, and each run's
+  `config.json` snapshot is the reproducibility record.
 
 ## 12. Rapid-fire Q&A
 
